@@ -1,9 +1,9 @@
 #ifndef param_hpp
 #define param_hpp
 
-#define num_path 100000
+#define num_path 10
 #define num_step 365
-#define num_rand_thread 2
+#define num_rand_thread 4
 
 const float T = 1.0f;
 const float K = 100.0f;

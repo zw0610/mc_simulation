@@ -2,45 +2,27 @@
 #include <math.h>
 #include <time.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 
+#include <cuda.h>
 #include <curand.h>
 #include <curand_kernel.h>
 
 #include "param.hpp"
 
 
-typedef struct {
+#define CURAND_CALL(x) do { if((x) != CURAND_STATUS_SUCCESS) { \ printf("Error at %s:%d\n",__FILE__,__LINE__); \ return EXIT_FAILURE;}} while(0)
 
-	bool avail;
-	float x;
 
-	__device__ void update( curandState_t &state, const float sqrdt ) {
-
-		x = sqrdt*curand_normal(&state);
-		avail = true;
-
-	}
-
-	__device__ void get( float &out ) {
-
-		out = x;
-		avail = false;
-
-	}
-
-} rand_real;
 
 /* Device functions */
 
-__global__ void mc_init(unsigned int seed, curandState_t* states) {
-	unsigned int idx = blockIdx.x*blockDim.x + threadIdx.x;
-	curand_init(seed, idx, 0, &states[idx]);
-}
-
 __global__ void mc_simulation(
-	curandState_t * states,
+	float * d_r,
 	float * d_s,
 	const float T,
     const float K,
@@ -50,47 +32,55 @@ __global__ void mc_simulation(
     const float mu,
     const float r,
     const float dt,
- 	const float sqrdt ) {
+ 	const float sqrdt,
+	const unsigned int num_round,
+	const unsigned int num_last_round) {
 
 	/* Initialize Shared Memory */
-	__shared__ rand_real rr[num_rand_thread];
+	/* Create double shared memory space */
+	__shared__ float rr[(num_rand_thread<<1)];
 
-	// Get the thread index. If 0, Assemble; if non-zero, generate random //
-	const unsigned int local_idx = threadIdx.x;
+	// Get the thread index. If blockDim.x-1, Assemble; if not-the-last, reading/loading random //
+	const unsigned int role_idx = threadIdx.x;
 	const unsigned int path_idx = blockIdx.x;
 
-	unsigned int count = 0;
+	bool loaded = 0;
 
-	float curr_s = 0.0f;
+	float mudt = mu*dt;
 
-	if ( local_idx==num_rand_thread ) {
-		/* Principle Thread, Assemble Role */
-		for ( count = 0; count < num_step; count++ ) {
-			float curr_rand_real = 0.0f;
-			bool yet_new_rand = true;
-			while ( yet_new_rand ) {
-				if ( rr[path_idx*num_step + count].avail ) {
-					rr[path_idx*num_step + count].get(curr_rand_real);
-					yet_new_rand = false;
-				}
+	float curr_s = S0;
+
+	if ( role_idx != num_rand_thread ) {
+		/* If the role_idx shows it's not the last thread, then loading */
+		/* random number from Global Memory to Shared Memory */
+		rr[role_idx] = d_r[ path_idx*num_step + role_idx ];
+	}
+	__syncthreads();
+	/* Keep all threads synchronized so assemble thread will not proceed */
+	/* before the first segment is fully loaded */
+
+
+	for (size_t i = 0; i < (num_round-1); i++) {
+
+		if ( role_idx == num_rand_thread ) {
+			for (size_t j = 0; j < num_rand_thread; j++) {
+				curr_s = curr_s + mudt*curr_s + sigma*curr_s*rr[ loaded*num_rand_thread + j ];
 			}
-
-			curr_s = curr_s + mu*curr_s*dt + sigma*curr_s*curr_rand_real;
-
-		}
-		d_s[path_idx] = curr_s;
-	} else {
-		/* Supporting Thread, Generating Random Numbers */
-		rr[local_idx].avail = false;
-		rr[local_idx].x = 0.0f;
-
-		while ( !(rr[local_idx].avail) ) {
-			rr[local_idx].update( states[path_idx*num_step + count*num_rand_thread + local_idx], sqrdt );
-			count++;
+		} else {
+			rr[ role_idx + (!loaded)*num_rand_thread ] = d_r[ path_idx*num_step + i*num_rand_thread + role_idx ];
 		}
 
+		loaded = !loaded;
+		__syncthreads();
 	}
 
+	if ( role_idx == num_rand_thread ) {
+		for (size_t j = 0; j < num_last_round; j++) {
+			curr_s = curr_s + mudt*curr_s + sigma*curr_s*rr[ loaded*num_rand_thread + j ];
+		}
+		d_s[path_idx] = 1.23f;
+		//printf("%i %i %f %f\n", role_idx, path_idx, S0, curr_s);
+	}
 
 }
 
@@ -99,19 +89,35 @@ __global__ void mc_simulation(
 /* Host functions */
 int main () {
 
-	thrust::device_vector<float> d_s(num_path, 0.0f);
-	float * d_s_ptr = thrust::raw_pointer_cast(d_s.data());
+	float *d_s = NULL;
+	cudaMalloc((void**) &d_s, num_path * sizeof(float));
 
-	curandState_t *state_list;
-	cudaMalloc((void**) &state_list, (num_path*num_step) * sizeof(curandState_t));
-	time_t timer;
-	mc_init<<<(num_path*num_step),1024>>>( time(&timer), state_list);
+	float *d_r = NULL;
+	cudaMalloc((void**) &d_r, num_path * num_step * sizeof(float));
 
-	mc_simulation<<<num_path, (num_rand_thread+1)>>>( state_list, d_s_ptr, T, K, B, S0, sigma, mu, r, dt, sqrdt );
+	curandGenerator_t gen;
+	curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+	curandSetPseudoRandomGeneratorSeed(gen, 1234ULL);
+    curandGenerateNormal(gen, d_r, (num_path*num_step), 0.0f, sqrdt);
+	curandDestroyGenerator(gen);
 
-	thrust::host_vector<float> h_s = d_s;
+	std::cout << "Random number generation is finished." << std::endl;
 
-	cudaFree(state_list);
+	unsigned int N_ROUND = (num_step/num_rand_thread);
+	unsigned int N_LASTR = num_step - N_ROUND*num_rand_thread;
+
+	mc_simulation<<<num_path, (num_rand_thread+1)>>>( d_r, d_s, T, K, B, S0, sigma, mu, r, dt, sqrdt, N_ROUND, N_LASTR );
+
+	float h_s[num_path];
+	cudaDeviceSynchronize();
+	cudaMemcpy(&h_s, d_s, num_path*sizeof(float),cudaMemcpyDeviceToHost);
+	cudaDeviceSynchronize();
+
+	
+
+	cudaFree(d_s);
+	cudaFree(d_r);
+	cudaDeviceSynchronize();
 
 	return 0;
 }
